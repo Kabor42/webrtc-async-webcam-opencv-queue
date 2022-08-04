@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import cv2
 import numpy
@@ -23,7 +23,7 @@ from loguru import logger
 
 ROOT = Path(__file__).parent.parent.resolve()
 
-VIDEO_CLOCK_RATE = 90000
+VIDEO_CLOCK_RATE = 600
 VIDEO_PTIME = 1 / 30
 VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
 
@@ -43,6 +43,7 @@ class OpenCVPlayerStreamTrack(PlayerStreamTrack):
 def opencv_player_worker(loop: asyncio.AbstractEventLoop,
                          video_track: OpenCVPlayerStreamTrack,
                          quit_event: Event, throttle_playback: bool):
+    logger.info("Starting worker")
     video_first_pts: Optional[int] = None
     frame_time: Optional[int] = None
     start_time = time.time()
@@ -61,9 +62,10 @@ def opencv_player_worker(loop: asyncio.AbstractEventLoop,
             logger.warning("Empty queue")
             break
 
-        _timestamp += int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
-        wait = _start + (_timestamp / VIDEO_CLOCK_RATE) - time.time()
-        time.sleep(wait)
+        _timestamp = int((time.time()-start_time)/30*600)*30
+        # wait = max(0, _start + (_timestamp / VIDEO_CLOCK_RATE) - time.time())
+        # time.sleep(wait)
+        # logger.info(f"{_timestamp=}")
 
         if throttle_playback:
             elapsed_time = time.time() - start_time
@@ -75,6 +77,7 @@ def opencv_player_worker(loop: asyncio.AbstractEventLoop,
             vf.pts = _timestamp
             vf.time_base = VIDEO_TIME_BASE
             asyncio.run_coroutine_threadsafe(video_track._queue.put(vf), loop)
+    logger.info("Worker stop event recieved")
 
 
 class OpenCVMediaPlayer(MediaPlayer):
@@ -101,6 +104,7 @@ class OpenCVMediaPlayer(MediaPlayer):
     def _start(self, track: OpenCVPlayerStreamTrack) -> None:
         self.__started.add(track)
         if self.__thread is None:
+            logger.info("Starting video trak.")
             self.__thread_quit = Event()
             self.__thread = Thread(name="media-player",
                                    target=opencv_player_worker,
@@ -110,6 +114,7 @@ class OpenCVMediaPlayer(MediaPlayer):
             self.__thread.start()
 
     def _stop(self, track: OpenCVPlayerStreamTrack) -> None:
+        logger.info("Stopping video trak.")
         self.__started.discard(track)
         if not self.__started and self.__thread is not None:
             self.__thread_quit.set()
@@ -124,7 +129,7 @@ def create_local_tracks(
     player = OpenCVMediaPlayer(queue)
     if relay is None:
         relay = MediaRelay()
-    return None, relay.subscribe(player.video)
+    return None, relay.subscribe(player.video, buffered=False)
 
 
 def force_codec(pc: RTCPeerConnection, sender: RTCRtpSender,
@@ -163,6 +168,10 @@ async def offer(request: web.Request):
     async def on_connectionsstatechange():
         logger.info(f"Connection state is {pc.connectionState}")
         if pc.connectionState == "failed":
+            logger.info("Connection failed, stopping")
+            for vt in pc.getSenders():
+                logger.info("Stopping senders")
+                logger.info(f"Sender track is {type(vt.track)}")
             await pc.close()
             pcs.discard(pc)
 
@@ -196,7 +205,7 @@ async def on_shutdown(app: web.Application) -> None:
 
 class Camera:
 
-    def __init__(self, device: str, output: Queue[numpy.ndarray]):
+    def __init__(self, device: Union[str, int], output: Queue[numpy.ndarray]):
         self.__device = device
         self.__cap: cv2.VideoCapture = cv2.VideoCapture(self.__device)
         self.__thread: Thread = None
@@ -274,16 +283,16 @@ class Camera:
 if __name__ == '__main__':
     logger.info(f"ROOT: {ROOT}")
 
-    input_queue = queue.Queue(30)
+    input_queue = queue.Queue(5)
 
-    camera = Camera('/dev/video0', input_queue)
+    camera = Camera(0, input_queue)
     logger.info(f'Options: {camera.options}')
     logger.info(f"Camera :{camera.device}")
     camera.set_options({
-        "width": 640,
-        "height": 480,
+        "width": 1920,
+        "height": 1280,
         "fps": 30,
-        "fourcc": "MJPG"
+        "fourcc": "H264"
     })
     logger.info(f'Options: {camera.options}')
 
@@ -297,5 +306,5 @@ if __name__ == '__main__':
     app.router.add_post("/offer", offer)
 
     camera.start()
-    web.run_app(app=app, host="127.0.0.1", port=8888, ssl_context=ssl_context)
+    web.run_app(app=app, host="127.0.0.1", port=8888, ssl_context=None)
     camera.stop()
